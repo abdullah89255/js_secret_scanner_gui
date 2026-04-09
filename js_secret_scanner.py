@@ -19,6 +19,7 @@ Usage examples:
 
 import re, sys, time, json, argparse, threading, socket
 import urllib.request, urllib.error, urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from collections import defaultdict
 
@@ -201,8 +202,8 @@ def redact(val):
 WAYBACK_CDX  = "https://web.archive.org/cdx/search/cdx"
 WAYBACK_BASE = "https://web.archive.org/web"
 
-CDX_DELAY   = 1.0
-FETCH_DELAY = 0.5
+CDX_DELAY   = 0.3   # was 1.0 — only needed between CDX strategies to avoid 429
+FETCH_DELAY = 0.1   # was 0.5 — brief pause between snapshot fetches
 
 
 def _req(url, timeout=20, retries=3):
@@ -220,12 +221,12 @@ def _req(url, timeout=20, retries=3):
         except urllib.error.HTTPError as e:
             last_err = "HTTP %s" % e.code
             if e.code in (429, 503, 502):
-                time.sleep(3 * (attempt + 1))
+                time.sleep(2 * (attempt + 1))   # was 3× — gentler back-off for rate limits
                 continue
             raise
         except (urllib.error.URLError, socket.timeout, OSError) as e:
             last_err = str(e)
-            time.sleep(2 * (attempt + 1))
+            time.sleep(1 * (attempt + 1))       # was 2× — faster retry on transient errors
     raise IOError("Failed after %d retries: %s" % (retries, last_err))
 
 
@@ -253,7 +254,7 @@ def _cdx_query(url, extra=None):
 def get_wayback_snapshots(url):
     msgs = []
 
-    # Strategy 1: exact + HTTP 200 + monthly dedup
+    # Strategy 1: exact + HTTP 200 + monthly dedup (fastest, most reliable)
     rows = _cdx_query(url, {"filter": "statuscode:200", "collapse": "timestamp:8"})
     errs = [sc for ts, sc in rows if ts == "ERROR"]
     if errs:
@@ -262,7 +263,7 @@ def get_wayback_snapshots(url):
     if ts1:
         msgs.append("CDX strategy 1 (exact+200+collapse): %d snapshot(s)" % len(ts1))
         return ts1, msgs
-    time.sleep(CDX_DELAY)
+    time.sleep(CDX_DELAY)  # 0.3s — just enough to avoid 429
 
     # Strategy 2: exact + any status + monthly dedup
     rows = _cdx_query(url, {"collapse": "timestamp:8"})
@@ -273,30 +274,30 @@ def get_wayback_snapshots(url):
     if ts2:
         msgs.append("CDX strategy 2 (exact+any status): %d snapshot(s)" % len(ts2))
         return ts2, msgs
-    time.sleep(CDX_DELAY)
 
-    # Strategy 3: exact + no filter + no collapse
-    rows = _cdx_query(url, {"limit": "5"})
-    errs = [sc for ts, sc in rows if ts == "ERROR"]
-    if errs:
-        msgs.append("CDX S3 error: %s" % errs[0])
-    ts3 = [ts for ts, sc in rows if ts != "ERROR"]
+    # Strategies 3 & 4: run concurrently to save time
+    def _s3():
+        return _cdx_query(url, {"limit": "5"})
+    def _s4():
+        return _cdx_query(url, {
+            "matchType": "prefix",
+            "filter":    "statuscode:200",
+            "collapse":  "urlkey",
+            "limit":     "5",
+        })
+
+    time.sleep(CDX_DELAY)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f3, f4 = pool.submit(_s3), pool.submit(_s4)
+        rows3 = f3.result()
+        rows4 = f4.result()
+
+    ts3 = [ts for ts, sc in rows3 if ts != "ERROR"]
     if ts3:
         msgs.append("CDX strategy 3 (exact+no filter): %d snapshot(s)" % len(ts3))
         return ts3, msgs
-    time.sleep(CDX_DELAY)
 
-    # Strategy 4: prefix match
-    rows = _cdx_query(url, {
-        "matchType": "prefix",
-        "filter":    "statuscode:200",
-        "collapse":  "urlkey",
-        "limit":     "5",
-    })
-    errs = [sc for ts, sc in rows if ts == "ERROR"]
-    if errs:
-        msgs.append("CDX S4 error: %s" % errs[0])
-    ts4 = [ts for ts, sc in rows if ts != "ERROR"]
+    ts4 = [ts for ts, sc in rows4 if ts != "ERROR"]
     if ts4:
         msgs.append("CDX strategy 4 (prefix): %d snapshot(s)" % len(ts4))
         return ts4, msgs
@@ -351,7 +352,6 @@ def process_js_url(url, results_store, lock, verbose=True):
 
     timestamps, cdx_msgs = get_wayback_snapshots(url)
     entry["errors"].extend(cdx_msgs)
-    time.sleep(FETCH_DELAY)
 
     if not timestamps:
         entry["errors"].append("No snapshots - trying live fetch")
@@ -364,9 +364,24 @@ def process_js_url(url, results_store, lock, verbose=True):
             entry["status"] = "no_snapshot"
             entry["errors"].append("Live fetch also failed")
     else:
-        for ts in timestamps[:5]:
+        # Limit to best 3 snapshots; fetch them concurrently
+        ts_list = timestamps[:3]
+
+        def _fetch_snap(ts):
             content, wb_url = fetch_wayback_content(url, ts)
-            time.sleep(FETCH_DELAY)
+            return ts, wb_url, content
+
+        snap_results = []
+        with ThreadPoolExecutor(max_workers=min(len(ts_list), 3)) as pool:
+            futures = {pool.submit(_fetch_snap, ts): ts for ts in ts_list}
+            for fut in as_completed(futures):
+                try:
+                    snap_results.append(fut.result())
+                except Exception as e:
+                    entry["errors"].append("Snapshot fetch error: %s" % e)
+
+        # Process fetched snapshots; stop scanning once findings are found
+        for ts, wb_url, content in snap_results:
             snap = {"timestamp": ts, "wb_url": wb_url}
             if content:
                 new_findings          = scan_content(content, wb_url)
@@ -374,10 +389,17 @@ def process_js_url(url, results_store, lock, verbose=True):
                 snap["bytes"]         = len(content)
                 entry["findings"].extend(new_findings)
                 entry["status"] = "scanned"
+                # Early-exit: no need to scan more snapshots once secrets found
+                if new_findings:
+                    entry["snapshots"].append(snap)
+                    break
             else:
                 snap["finding_count"] = 0
                 entry["errors"].append("Snapshot %s: id_ and if_ both failed" % ts)
             entry["snapshots"].append(snap)
+
+        if entry["status"] == "pending":
+            entry["status"] = "no_snapshot"
 
     seen, deduped = set(), []
     for f in entry["findings"]:
@@ -877,20 +899,19 @@ def build_json_report(js_results, ep_results, output_path):
 # ══════════════════════════════════════════════════════════════
 #  THREADED RUNNER
 # ══════════════════════════════════════════════════════════════
+
 def run_threaded(items, worker_fn, worker_kwargs, threads):
+    """Run worker_fn over items with a real thread-pool (no per-spawn sleep)."""
     results, lock = [], threading.Lock()
-    sem = threading.Semaphore(threads)
     def _wrap(item):
-        with sem:
-            worker_fn(item, results, lock, **worker_kwargs)
-    pool = []
-    for item in items:
-        t = threading.Thread(target=_wrap, args=(item,))
-        t.start()
-        pool.append(t)
-        time.sleep(0.15)
-    for t in pool:
-        t.join()
+        worker_fn(item, results, lock, **worker_kwargs)
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(_wrap, item) for item in items]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception:
+                pass
     return results
 
 # ══════════════════════════════════════════════════════════════
